@@ -17,6 +17,7 @@
 #include <LibFileSystem/FileSystem.h>
 #include <LibMain/Main.h>
 #include <LibRegex/Regex.h>
+#include <cmath>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -73,6 +74,9 @@ ErrorOr<int> serenity_main(Main::Arguments args)
     bool count_lines = false;
 
     size_t matched_line_count = 0;
+
+    size_t before_context = 0;
+    size_t after_context = 0;
 
     Core::ArgsParser args_parser;
     args_parser.add_option(recursive, "Recursively scan files", "recursive", 'r');
@@ -158,6 +162,8 @@ ErrorOr<int> serenity_main(Main::Arguments args)
         },
     });
     args_parser.add_option(count_lines, "Output line count instead of line contents", "count", 'c');
+    args_parser.add_option(before_context, "Print NUM lines of leading context", "before-context", 'B', "NUM");
+    args_parser.add_option(after_context, "Print NUM lines of trailing context", "after-context", 'A', "NUM");
     args_parser.add_positional_argument(files, "File(s) to process", "file", Core::ArgsParser::Required::No);
     args_parser.parse(args);
 
@@ -194,18 +200,20 @@ ErrorOr<int> serenity_main(Main::Arguments args)
             }
         }
 
-        auto matches = [&](StringView str, StringView filename, size_t line_number, bool print_filename, bool is_binary) {
+        auto matches = [&](StringView str, StringView filename, size_t line_number, bool print_filename, bool is_binary, Vector<StringView> context_before = {}, Vector<StringView> context_after = {}) {
             size_t last_printed_char_pos { 0 };
             if (is_binary && binary_mode == BinaryFileMode::Skip)
                 return false;
 
             for (auto& re : regular_expressions) {
                 auto result = re.match(str, PosixFlags::Global);
-                if (!(result.success ^ invert_match))
+                if (!(result.success ^ invert_match)) {
                     continue;
+                }
 
-                if (quiet_mode)
+                if (quiet_mode) {
                     return true;
+                }
 
                 if (count_lines) {
                     matched_line_count++;
@@ -215,10 +223,30 @@ ErrorOr<int> serenity_main(Main::Arguments args)
                 if (is_binary && binary_mode == BinaryFileMode::Binary) {
                     outln(colored_output ? "binary file \x1B[34m{}\x1B[0m matches"sv : "binary file {} matches"sv, filename);
                 } else {
-                    if ((result.matches.size() || invert_match) && print_filename)
+                    if ((result.matches.size() || invert_match) && print_filename) {
                         out(colored_output ? "\x1B[34m{}:\x1B[0m"sv : "{}:"sv, filename);
-                    if ((result.matches.size() || invert_match) && line_numbers)
+                    }
+                    if ((result.matches.size() || invert_match) && line_numbers) {
                         out(colored_output ? "\x1B[35m{}:\x1B[0m"sv : "{}:"sv, line_number);
+                    }
+
+                    if (!context_before.is_empty()) {
+                        size_t last_match_index = 0;
+                        for (size_t i = 0; i < context_before.size(); ++i) {
+                            auto has_match = re.match(context_before.at(i), PosixFlags::Global);
+                            if (has_match.success ^ invert_match) {
+                                last_match_index = i + 1;
+                                break;
+                            }
+                        }
+
+                        dbgln("last match index: {}", last_match_index);
+                        for (size_t i = last_match_index; i < context_before.size(); ++i) {
+                            auto line = context_before.at(i);
+                            dbgln("context line in context_before: {}", line);
+                            outln(line);
+                        }
+                    }
 
                     for (auto& match : result.matches) {
                         auto pre_match_length = match.global_offset - last_printed_char_pos;
@@ -229,6 +257,13 @@ ErrorOr<int> serenity_main(Main::Arguments args)
                     }
                     auto remaining_length = str.length() - last_printed_char_pos;
                     outln("{}", remaining_length > 0 ? StringView(&str[last_printed_char_pos], remaining_length) : ""sv);
+                    for (auto line : context_after) {
+                        auto has_match = re.match(line, PosixFlags::Global);
+                        if (has_match.success ^ invert_match) {
+                            break;
+                        }
+                        outln(line);
+                    }
                 }
 
                 return true;
@@ -288,22 +323,86 @@ ErrorOr<int> serenity_main(Main::Arguments args)
             ssize_t nread = 0;
             ScopeGuard free_line = [line] { free(line); };
             size_t line_number = 0;
+            StringBuilder context_builder;
+            Vector<String> context_vector;
             while ((nread = getline(&line, &line_len, stdin)) != -1) {
                 VERIFY(nread > 0);
-                if (line[nread - 1] == '\n')
+                if (line[nread - 1] == '\n') {
                     --nread;
+                }
                 // Human-readable indexes start at 1, so it's fine to increment already.
                 line_number += 1;
                 StringView line_view(line, nread);
+
                 bool is_binary = line_view.contains('\0');
 
-                if (is_binary && binary_mode == BinaryFileMode::Skip)
+                if (is_binary && binary_mode == BinaryFileMode::Skip) {
                     return 1;
+                }
 
-                auto matched = matches(line_view, "stdin"sv, line_number, false, is_binary);
+                context_vector.append(String::from_utf8(line_view).release_value_but_fixme_should_propagate_errors());
+                if (context_vector.size() > before_context + 1 + after_context) {
+                    context_vector.remove(0);
+                }
+
+                // Index of the context vector to take a line from to match
+                int matching_index = context_vector.size() - 1 - after_context;
+                // context_vector.size - 1 - after_context < 0
+                // context_vector.size - 1 > after_context
+                dbgln("matching_index: {}", matching_index);
+                if (matching_index < 0) {
+                    continue;
+                }
+
+                auto line_to_be_matched = context_vector.at(matching_index).bytes_as_string_view();
+
+                Vector<StringView> before_context_vector;
+                for (int i = 0; i < matching_index; ++i) {
+                    before_context_vector.append(context_vector.at(i));
+                }
+
+                Vector<StringView> after_context_vector;
+                for (size_t i = matching_index + 1; i < context_vector.size(); ++i) {
+                    after_context_vector.append(context_vector.at(i));
+                }
+
+                auto matched = matches(line_to_be_matched, "stdin"sv, line_number - after_context, false, is_binary, before_context_vector, after_context_vector);
                 did_match_something = did_match_something || matched;
                 if (matched && is_binary && binary_mode == BinaryFileMode::Binary)
                     break;
+            }
+
+            // -A 2
+
+            // test1    <-- match
+            // context1 <-- in context vector -- gets printed
+            // test2    <-- in context vector -- doesn't get printed because matches don't get printed as context, after context printing loop breaks
+            // context2 <-- in context vector -- doesn't get printed
+            // Break out of loop because we have read all the lines from the file
+
+            // Once done reading through file context vector:
+            // [test2, context2]
+            // Loop through context vector to look for any missed matches
+            // test2    <-- match, gets printed as a match
+            // context2 <-- not a match, needs to get printed
+
+            // If there is after context, the context vector will always contain the last <after_context + 1> lines in the file
+            // If after context is greater than the number of lines in the file, then the whole file is put in to the context vector
+
+            // Matches in context vector
+            //            dbgln("line_number: {}, context_vector.size(): {}, did match something: {}", line_number, context_vector.size(), did_match_something);
+            Vector<StringView> after_context_vector;
+            for (auto const& context_line : context_vector) {
+                after_context_vector.append(context_line);
+            }
+            bool whole_file_in_context_vector = (context_vector.size() >= line_number && !did_match_something);
+            if (after_context > 0) {
+                for (size_t i = !whole_file_in_context_vector; i < context_vector.size(); ++i) {
+                    auto context_line = context_vector.at(i);
+                    after_context_vector.remove(0);
+                    auto matched = matches(context_line, "stdin"sv, line_number + i, false, false, {}, after_context_vector);
+                    did_match_something = did_match_something || matched;
+                }
             }
 
             if (count_lines && !quiet_mode)
